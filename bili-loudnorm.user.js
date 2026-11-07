@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         响度均衡
 // @namespace    bili-loudnorm
-// @version      1.1.0
+// @version      1.1.1
 // @description  测量整段视频的响度，按需施加一个固定增益，拉齐 B 站连播时忽大忽小的音量。不压缩原声、不干预播放器；覆盖普通投稿、多 P、番剧影视选集。
 // @license      MIT
 // @match        https://www.bilibili.com/video/*
@@ -1192,19 +1192,22 @@
         if (target.epId) return 'https://www.bilibili.com/bangumi/play/ep' + target.epId;
         return String(location.href || '');
       }
-      // 读者所在的落地页 URL（去掉 p 之类的选集参数），活动页 /festival/… 也按它自己的地址回读
-      let here = '';
-      try { here = String(location.origin || '') + String(location.pathname || ''); } catch (e) { here = ''; }
-      const l = Target.pageQuery();
-      const p = Number((/(?:^|[?&])p=(\d+)/.exec(l) || [])[1] || 1);
-      if (here) {
-        const cur = String(location.href || '');
-        // 当前页本来就是这一集：直接读当前页。活动页的 __playinfo__ 只在它自己的 SSR 里，
-        // 重开 /video/ 落地页拿到的是另一套（常常连 volume 都没有）
-        if (p === target.p) return cur || here;
-        // 选集后的「同一张视频另一集」也走这里：/video/BVxxxx?p=N 的 SSR 就是这一集的
-        return here + '?p=' + target.p;
+
+      // 官方响度只存在于**标准落地页** /video/BVxxxx 的 SSR 里（__playinfo__.data.volume）。
+      // 活动页 /festival/* 和列表页 /list/* 的 HTML 只是播放器外壳，实测再大的页面里
+      // 也搜不到 __playinfo__/measured_i；它们的播放器自己也是走 playurl 接口，
+      // 而那个接口根本不返回 volume。所以这两种页型一律回落到标准落地页。
+      let path = '';
+      try { path = String(location.pathname || ''); } catch (e) { path = ''; }
+      const onThisVideo = path === '/video/' + target.bvid || path === '/video/' + target.bvid + '/';
+      if (onThisVideo) {
+        const l = Target.pageQuery();
+        const p = Number((/(?:^|[?&])p=(\d+)/.exec(l) || [])[1] || 1);
+        // 当前页本来就是这一集：直接读当前页，省一次整页请求
+        if (p === target.p) return String(location.href || '') || path;
       }
+
+      // 同一张视频的其它集、以及活动页 / 列表页，都按标准的 /video/BVxxxx?p=N 取
       const q = target.p > 1 ? '?p=' + target.p : '';
       return 'https://www.bilibili.com/video/' + target.bvid + q;
     }

@@ -778,6 +778,71 @@ group('端到端：接口没有 volume → 回读该集 SSR 继续用 B 站参�
   near(st.gain, 7.7, 0.05, '增益 = -14 −(−21.7) = +7.7dB');
 }
 
+/* ---------------- 活动页 /festival/*：SSR 要回落到标准落地页 ---------------- */
+group('活动页：官方响度从 /video/BV... 的 SSR 取，而不是活动页自己的 HTML');
+{
+  net.fetch = null;
+  win.location.pathname = '/festival/S16';
+  win.location.search = '?bvid=BV1fest01';
+  win.location.href = 'https://www.bilibili.com/festival/S16?bvid=BV1fest01';
+  api.setTarget(-14);
+
+  // 活动页自己的 HTML 只是播放器外壳，实测搜不到 __playinfo__
+  const festivalShell = '<html><title>S16</title><script>window.__INITIAL_STATE__={"activityKey":"S16"}</script></html>';
+  const videoSsr = '<html><script>window.__playinfo__='
+    + JSON.stringify({ data: { dash: { duration: 200 }, volume: { measured_i: -21.7, measured_tp: -20 } } })
+    + '</script></html>';
+
+  let festivalHits = 0;
+  const ssrTargets = [];
+  net.handler = (o) => {
+    const u = o.url;
+    let body;
+    if (u.indexOf('web-interface/view') >= 0) {
+      body = JSON.stringify({ code: 0, data: { pages: [{ cid: 222, page: 1 }] } });
+    } else if (u.indexOf('playurl') >= 0) {
+      body = JSON.stringify({
+        code: 0,
+        data: {
+          dash: {
+            duration: 200,
+            audio: [{ id: 30232, baseUrl: 'https://x.test/f.m4s', SegmentBase: { Initialization: '0-9', indexRange: '10-40' } }],
+          },
+          timelength: 200000,
+          // 接口没有 volume（线上就是如此）
+        },
+      });
+    } else if (u.indexOf('/festival/') >= 0) {
+      festivalHits++;
+      body = festivalShell;
+    } else if (u.indexOf('www.bilibili.com/video/BV1fest01') >= 0) {
+      ssrTargets.push(u);
+      body = videoSsr;
+    } else {
+      body = '{}';
+    }
+    const payload = o.responseType === 'arraybuffer' ? new ArrayBuffer(10) : body;
+    setTimeout(() => o.onload({ status: 200, response: payload }), 0);
+  };
+
+  const video6 = {
+    tagName: 'VIDEO', duration: 200, currentTime: 0, paused: true, volume: 1,
+    currentSrc: 'blob:6', addEventListener() {}, removeEventListener() {},
+  };
+  documentStub.querySelector = (sel) => (sel === 'video' ? video6 : null);
+
+  await api._.Lifecycle.tick('festival-test');
+  await new Promise((r) => setTimeout(r, 300));
+
+  const st = api._.Analyzer.snapshot();
+  ok(festivalHits === 0, '没有去拉活动页自己的 HTML（它永远没有 __playinfo__）', String(festivalHits));
+  ok(ssrTargets.length >= 1 && ssrTargets[0].indexOf('www.bilibili.com/video/BV1fest01') >= 0,
+    '回读的是标准的 /video/BV... 落地页', ssrTargets[0] || '(none)');
+  ok(st.state === 'applied', '分析完成', st.state + ' / ' + st.text);
+  ok(st.source === 'meta', '用上了 B 站官方值，而不是本地抽样', st.source);
+  near(st.i, -21.7, 0.1, '实测响度来自官方 volume');
+}
+
 /* ---------------- 缓存上限 / 淘汰 ---------------- */
 group('缓存：上限与手动清理');
 {
