@@ -120,7 +120,10 @@ function fakeEl() {
       if (!this._q) this._q = {};
       return this._q[sel] || (this._q[sel] = fakeEl());
     },
-    setAttribute() {},
+    setAttribute(k, v) { (this._attrs || (this._attrs = {}))[k] = String(v); },
+    hasAttribute(k) { return !!(this._attrs && Object.prototype.hasOwnProperty.call(this._attrs, k)); },
+    getAttribute(k) { return (this._attrs && this._attrs[k]) || null; },
+    removeAttribute(k) { if (this._attrs) delete this._attrs[k]; },
   };
   el.tagName = 'DIV';
   Object.defineProperty(el, 'className', {
@@ -158,7 +161,7 @@ const documentStub = {
 const win = {
   AudioContext: FakeCtx,
   OfflineAudioContext: FakeCtx,
-  location: { pathname: '/video/BV1test12345', search: '?p=1', href: 'https://www.bilibili.com/video/BV1test12345?p=1' },
+  location: { pathname: '/video/BV1test12345', search: '?p=1', origin: 'https://www.bilibili.com', href: 'https://www.bilibili.com/video/BV1test12345?p=1' },
   document: documentStub,
   navigator: { userAgent: 'node' },
   addEventListener() {},
@@ -228,6 +231,18 @@ group('节奏参数');
 ok(api._.CFG.partialIntervalMs === 500, '抽样重算间隔 = 500ms');
 ok(api._.CFG.fadeMs === 100, '增益淡入淡出 = 100ms');
 
+/* ---------------- 显示格式 ---------------- */
+group('显示格式');
+{
+  const num = api._.U.fmtDbNum;
+  ok(num(2.3) === '+2.3', '数值只取一位小数（+2.3）', num(2.3));
+  ok(num(0) === '+0.0', '零增益是 +0.0', num(0));
+  ok(num(-0.82) === '-0.8', '衰减也是一位小数', num(-0.82));
+  ok(num(0.004) === '+0.0', '先四舍五入再取位', num(0.004));
+  ok(num(-0.04) === '-0.0' || num(-0.04) === '+0.0', '不出现 -0.0', num(-0.04));
+  ok(api._.U.fmtDb(2.3) === '+2.3 dB', '日志里仍带 dB 后缀', api._.U.fmtDb(2.3));
+}
+
 /* ---------------- K 加权 ---------------- */
 group('K 加权（BS.1770-4，48kHz）');
 {
@@ -290,12 +305,14 @@ group('增益规划');
 
   const c = GainPlan.plan({ measuredI: -23.8, truePeak: -3 });
   near(c.gainDb, 2, 0.001, '峰值预算把 +9.8 压到 +2 dB');
-  ok(c.reasons.includes('峰值预算'), '峰值预算原因');
+  ok(c.reasons.includes('峰值受限'), '提升被峰值挡住时给「峰值受限」（面板第二行用）');
+  ok(!c.reasons.includes('峰值预算'), '不再出现内部名「峰值预算」');
 
   // 素材本身就顶到满刻度时，只挡提升，绝不下压（-22.2 LUFS + 近满刻度峰值 → 0，而不是 -0.82）
   const hot = GainPlan.plan({ measuredI: -22.2, truePeak: -0.3 });
   near(hot.gainDb, 0, 0.001, '峰值超预算时增益停在 0 dB，不会变成负的', hot.gainDb);
-  ok(hot.reasons.includes('峰值预算'), '并标明峰值受限');
+  ok(hot.reasons.includes('峰值受限'), '并标明峰值受限');
+  ok(!hot.reasons.includes('峰值预算'), '不混进「峰值预算」');
 
   const loud = GainPlan.plan({ measuredI: -8, truePeak: -0.3 });
   near(loud.gainDb, -6, 0.001, '本来就要衰减的照常衰减（峰值不挡衰减）');
@@ -349,7 +366,7 @@ function buildSidx(refs, timescale, firstOffset) {
   ok(r.refs[2].offset === r.refs[1].offset + 2000, '第三段偏移累加');
   ok(r.endOffset === r.refs[2].offset + 3000, 'endOffset = 末段结束');
   near(r.refs[0].duration, 1, 1e-9, '每段时长 1s（timescale 48000 / 48000）');
-  near(r.duration, 3, 1e-9, '总时长 3s');
+  near(r.refs[2].start, 2, 1e-9, '最后一段的起始时间 = 前两段之和');
 }
 {
   const many = [];
@@ -409,11 +426,8 @@ group('音频引擎');
   near(lastRampTime, 0.1, 1e-9, '淡变时长 100ms（ramp 目标 = now + 0.1s）', lastRampTime);
   near(Engine.appliedDb(), 6, 1e-9, 'appliedGain = +6dB');
   near(Engine.desiredDb(), 6, 1e-9, 'desiredGain 保留');
-  Engine.setBypass(true);
-  near(Engine.appliedDb(), 0, 1e-9, '旁路 → 0dB');
-  near(Engine.desiredDb(), 6, 1e-9, '旁路不改目标值');
-  Engine.setBypass(false);
-  near(Engine.appliedDb(), 6, 1e-9, '关旁路立即恢复');
+  ok(typeof Engine.setBypass === 'undefined' && typeof Engine.toggleBypass === 'undefined',
+    '旁路 API 已删除（没有 setBypass / toggleBypass）');
 }
 
 /* ---------------- 端到端（假 DOM + 假 playinfo） ---------------- */
@@ -459,12 +473,7 @@ group('端到端：接管 → 取元数据 → 落位');
   // 换目标响度：应当立刻用缓存里的测量值重算，不再取流
   api.setTarget(-20);
   near(Engine.appliedDb(), 3.8, 0.01, '目标改成 -20 后增益变 +3.8dB');
-
-  // 旁路
-  api.bypass(true);
-  near(Engine.appliedDb(), 0, 0.01, '旁路 → 0dB');
-  api.bypass(false);
-  near(Engine.appliedDb(), 3.8, 0.01, '关旁路恢复 +3.8dB');
+  ok(typeof api.bypass === 'undefined', '__bln.bypass 也已删除');
 }
 
 /* ---------------- 端到端：抽样路径 ---------------- */
@@ -704,8 +713,10 @@ group('端到端：接口没有 volume → 回读该集 SSR 继续用 B 站参�
 {
   net.fetch = null;
   win.location.pathname = '/video/BV1ssr888';
-  win.location.search = '';
   win.location.href = 'https://www.bilibili.com/video/BV1ssr888';
+  // 真浏览器里 href 与 pathname 始终同步：这里也必须一起改，否则 pageQuery()
+  // 会从 href 里读到上一组用例留下的旧地址
+  win.location.search = '';
   api.setTarget(-14);
 
   // 页面里的 __playinfo__ 是旧的（时长对不上），应判定不可信
@@ -862,9 +873,11 @@ group('嵌进播放器控制栏：「响」按钮 + 面板');
 
   ok(api._.UI.ensure() === true, '控制栏在时能插入按钮');
 
-  const inserted = (bar._kids || []).filter((k) => k.title === '响度均衡')[0];
+  const inserted = (bar._kids || []).filter((k) => k.hasAttribute('data-bln-btn'))[0];
   ok(!!inserted, '「响」被插进控制栏');
   ok(inserted.className === 'bpx-player-ctrl-btn', '按钮只带原生类名，没有额外类', inserted.className);
+  ok(!inserted.hasAttribute('title') && !inserted.title, '按钮不带 title（悬停不会弹「响度均衡」提示框）');
+  ok(!inserted.hasAttribute('aria-label'), '按钮不带 aria-label');
   ok(bar._anchor === volumeBtn, '插在倍速之后（即倍速右侧、音量左侧）');
   ok(inserted.parentElement === bar, '父节点就是控制栏');
 
@@ -891,8 +904,17 @@ group('嵌进播放器控制栏：「响」按钮 + 面板');
   ok(!/class="menu"/.test(html), '不再自绘面板外壳');
 
   ok(/响度增益/.test(html), '第一行标题是「响度增益」');
-  ok(html.indexOf('id="bln-remeasure"') > html.indexOf('id="bln-src"'), '「重新获取」排在 [官]/[本] 后面');
   ok(!/aria-label=/.test(code) && !/setAttribute\('aria-label'/.test(code), '脚本里不再写 aria-label');
+  ok(html.indexOf('bln-remeasure') < 0, '「重新获取」已从面板移除');
+  ok(/<span id="bln-gain-val">—<\/span><span id="bln-gain-unit">dB<\/span>/.test(html),
+    '「dB」是独立节点，不在数值里');
+  ok(/<span id="bln-meas">—<\/span><span id="bln-goal"><i>→<\/i><span id="bln-tgt">—<\/span><\/span><span id="bln-meas-unit">LUFS<\/span>/.test(html),
+    '顺序是「原始 → 实际 LUFS」，LUFS 在 [限] 之前');
+  ok(/<span id="bln-meas-tag"><\/span>/.test(html), '[限] 也是独立节点');
+  ok(/<div class="bln-head"><span class="bln-name">响度增益<\/span><span class="bln-dot"/.test(html),
+    '状态灯紧跟在「响度增益」后面');
+  ok(!/旁路|toggleBypass|setBypass|isBypass|shiftKey/.test(code), '旁路相关代码全部删除');
+  ok(/@match\s+https:\/\/www\.bilibili\.com\/festival\/\*/.test(code), '元数据里加了 /festival/* 匹配');
 
   ['标准', '高动态', '深夜', '耳机', '外放', '关闭'].forEach(function (label) {
     ok(html.indexOf('>' + label + '<') >= 0, '选项里有「' + label + '」');
@@ -952,24 +974,60 @@ group('嵌进播放器控制栏：「响」按钮 + 面板');
   ok(CFG.preset === 'speaker', '关掉时预设名仍保留，便于再打开', CFG.preset);
   ok(el('bln-p-off').checked === true && el('bln-p-speaker').checked === false, '「关闭」是选中态');
 
-  // 渲染：关闭时不能还显示 dB；限幅只挂悬停提示
+  // 渲染：关闭时不能还显示 dB 和单位
   api._.UI.render({ state: 'off', text: '已关闭', gain: -0.82, i: -22.2, metaSrc: 'meta', reasons: [] });
-  ok(el('bln-gain').textContent === '已关闭', '关闭时第一行显示「已关闭」而不是 dB', el('bln-gain').textContent);
+  ok(el('bln-gain-val').textContent === '已关闭', '关闭时第一行显示「已关闭」而不是数值', el('bln-gain-val').textContent);
   ok(el('bln-st').textContent === '当前响度', '关闭时第二行仍写「当前响度」', el('bln-st').textContent);
   ok(el('bln-src').textContent === '', '关闭时不显示 [官]/[本]');
-  ok(el('bln-remeasure').classList.contains('bln-hide'), '关闭时「重新获取」也一起隐藏');
-  ok(el('bln-goal').classList.contains('bln-hide'), '关闭时不再显示「→ 目标」');
+  ok(el('bln-v').classList.contains('bln-hide'), '关闭时数值组整块不显示');
   ok(!el('bln-dot').classList.contains('ok'), '关闭时状态灯不是绿的');
 
   CFG.enabled = true;
-  api._.UI.render({ state: 'applied', text: '当前响度', gain: 0, i: -22.2, metaSrc: 'meta', reasons: ['峰值预算'] });
-  ok(el('bln-gain').textContent === '+0.00 dB', '峰值受限时增益显示 +0.00 dB', el('bln-gain').textContent);
-  ok(!/峰值|上限|下限/.test(host.innerHTML), '面板上不挂「峰值 / 上限 / 下限」字样');
-  ok(el('bln-gain').title === '峰值预算', '限幅原因只留在悬停提示里', el('bln-gain').title);
+  api._.UI.render({ state: 'applied', text: '当前响度', gain: 0, i: -22.2, metaSrc: 'meta', reasons: ['峰值受限'] });
+  ok(el('bln-gain-val').textContent === '+0.0', '增益数值只放数字（+0.0），dB 是独立节点', el('bln-gain-val').textContent);
+  ok(!el('bln-v').classList.contains('bln-hide'), '有数值时数值组显示');
+  ok(el('bln-tgt').textContent === '-22.2', '增益为 0 时也显示「原始 → 实际」（两边相同）', el('bln-tgt').textContent);
+  ok(!el('bln-goal').classList.contains('bln-hide'), '箭头始终显示，不随增益变化');
+  ok(el('bln-meas-tag').textContent === '[限]', '[限] 是独立节点，不再塞进单位里', el('bln-meas-tag').textContent);
+  ok(!el('bln-gain').hasAttribute('title'), 'dB 值上不挂任何 title（鼠标停上去没有提示）');
   ok(el('bln-dot').classList.contains('ok'), '状态灯恢复绿色');
-  ok(!el('bln-remeasure').classList.contains('bln-hide'), '重新打开后「重新获取」回来');
-  ok(!el('bln-goal').classList.contains('bln-hide'), '打开时显示「实测 → 目标」');
 
+  // 单位只出现一次：箭头后面不再跟 LUFS
+  ok(html.indexOf('bln-tgt-unit') < 0, '箭头后面没有第二个 LUFS 节点');
+
+  // 正常落到目标：-16.3 LUFS +2.3 dB → 「-16.3 LUFS → -14.0」
+  api._.UI.render({ state: 'applied', text: '当前响度', gain: 2.3, i: -16.3, metaSrc: 'meta', reasons: [] });
+  ok(el('bln-meas').textContent === '-16.3' && el('bln-meas-unit').textContent === 'LUFS',
+    '实测值 + 唯一一个 LUFS', el('bln-meas').textContent + ' ' + el('bln-meas-unit').textContent);
+  ok(el('bln-tgt').textContent === '-14.0', '箭头后面是加完增益的实际响度', el('bln-tgt').textContent);
+  ok(el('bln-meas-tag').textContent === '', '正常落地不挂 [限]');
+
+  // 峰值受限：-18 LUFS 只给 +3 dB → 「-18.0 LUFS → -15.0 [限]」
+  api._.UI.render({ state: 'applied', text: '当前响度', gain: 3, i: -18, metaSrc: 'meta', reasons: ['峰值受限'] });
+  ok(el('bln-tgt').textContent === '-15.0', '[限] 时箭头后面是真正落到的响度', el('bln-tgt').textContent);
+  ok(el('bln-meas-tag').textContent === '[限]', '[限] 仍然显示', el('bln-meas-tag').textContent);
+
+  // 峰值受限但一点没提上去：-16.0 + 0 dB，预算是 0
+  api._.UI.render({ state: 'applied', text: '当前响度', gain: 0, i: -16, metaSrc: 'meta', reasons: ['峰值受限'] });
+  ok(el('bln-meas').textContent === '-16.0' && el('bln-meas-unit').textContent === 'LUFS',
+    '+0.0 dB 时单位仍然紧跟原始值', el('bln-meas').textContent + ' ' + el('bln-meas-unit').textContent);
+  ok(el('bln-tgt').textContent === '-16.0', '原始 → 实际，实际也是 -16.0', el('bln-tgt').textContent);
+  ok(!el('bln-goal').classList.contains('bln-hide'), '箭头照样显示');
+  ok(el('bln-meas-tag').textContent === '[限]', '[限] 照样显示', el('bln-meas-tag').textContent);
+
+  api._.UI.render({ state: 'error', text: '分析失败：试看片段抽样失败：只拿到 0 段', gain: null, i: null, metaSrc: 'tourist', reasons: [] });
+  ok(el('bln-gain-val').textContent === 'error', '报错时第一行显示 error', el('bln-gain-val').textContent);
+  ok(el('bln-st').textContent === '试看片段抽样失败：只拿到 0 段', '报错时第二行说明文换成原因', el('bln-st').textContent);
+  ok(el('bln-v').classList.contains('bln-hide'), '报错时数值组整块不显示');
+  ok(el('bln-dot').classList.contains('err'), '报错时状态灯是红的');
+
+  api._.UI.render({ state: 'error', text: '分析失败：试看片段无法解码（mp4a aot=2）：Unable to decode audio data', gain: null, i: null, metaSrc: 'tourist', reasons: [] });
+  ok(el('bln-src').textContent === '', '报错时不显示 [官]/[本]');
+  ok(el('bln-st').textContent.indexOf('试看片段无法解码') === 0, '报错时第二行写原因', el('bln-st').textContent);
+  ok(el('bln-v').classList.contains('bln-hide'), '报错时数值组不显示');
+
+  api._.UI.render({ state: 'run', text: '读取 moov 样本表…', progress: '1/8', gain: null, i: null, metaSrc: 'tourist', reasons: [] });
+  ok(el('bln-v').classList.contains('bln-hide'), '读取中还没有数值时数值组整块不显示');
   CFG.preset = saved.preset;
   CFG.target = saved.target;
   CFG.maxBoost = saved.boost;

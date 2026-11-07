@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         响度均衡
 // @namespace    bili-loudnorm
-// @version      1.0.0
+// @version      1.1.0
 // @description  测量整段视频的响度，按需施加一个固定增益，拉齐 B 站连播时忽大忽小的音量。不压缩原声、不干预播放器；覆盖普通投稿、多 P、番剧影视选集。
 // @license      MIT
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
 // @match        https://www.bilibili.com/bangumi/play/*
+// @match        https://www.bilibili.com/festival/*
 // @exclude      https://www.bilibili.com/video/*/play/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -128,7 +129,6 @@
    * 小工具
    * ================================================================ */
   const U = {
-    clamp: function (v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; },
     round: function (v, n) {
       const p = Math.pow(10, n === undefined ? 2 : n);
       return Math.round(v * p) / p;
@@ -136,9 +136,17 @@
     dbToLinear: function (db) { return Math.pow(10, db / 20); },
     linearToDb: function (lin) { return 20 * Math.log10(lin > 0 ? lin : 1e-12); },
     sleep: function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); },
+    /** 只算数值（+2.3 / -0.8 / +0.0），单位由 HTML 里的独立节点给出，便于控制间距 */
+    fmtDbNum: function (v) {
+      if (!Number.isFinite(v)) return '—';
+      // 先四舍五入再取一位：+0.004 不能被显示成 +0.0，+0.006 不能被抹成 +0.0
+      const r = Math.round(v * 10) / 10;
+      const z = r === 0 ? 0 : r;   // 去掉 -0.0
+      return v > 0 && z === 0 ? '+0.0' : (z >= 0 ? '+' : '') + z.toFixed(1);
+    },
     fmtDb: function (v) {
       if (!Number.isFinite(v)) return '—';
-      return (v >= 0 ? '+' : '') + v.toFixed(2) + ' dB';
+      return U.fmtDbNum(v) + ' dB';
     },
     now: function () { return Date.now(); },
   };
@@ -321,7 +329,7 @@
     /**
      * @param {ArrayBuffer} buf    含 sidx 的那一小段（indexRange 拉回来的字节）
      * @param {number} anchor      buf[0] 在文件里的绝对偏移（通常是 indexRange.start）
-     * @returns {null|{timescale:number, firstOffset:number, endOffset:number, refs:Array}}
+     * @returns {null|{endOffset:number, refs:Array<{offset:number,size:number,duration:number,start:number}>}}
      */
     function parse(buf, anchor) {
       if (!buf || buf.byteLength < 16) return null;
@@ -391,13 +399,7 @@
         }
       }
 
-      return {
-        timescale: timescale,
-        firstOffset: firstOffset,
-        endOffset: cursor,
-        duration: t,
-        refs: refs,
-      };
+      return { endOffset: cursor, refs: refs };
     }
 
     /** 等距挑 n 段（含首尾），去重后返回 */
@@ -722,11 +724,12 @@
       if (gain < CFG.minGain) { gain = CFG.minGain; reasons.push('衰减下限'); }
 
       if (Number.isFinite(m.truePeak)) {
-        // 峰值预算只能「挡住提升」，绝不因为峰值高就把声音压小
+        // 峰值上限只能「挡住提升」，绝不因为峰值高就把声音压小
         const budget = Math.max(0, CFG.ceiling - m.truePeak);
         if (gain > budget) {
           gain = budget;
-          reasons.push('峰值预算');
+          // 面板第二行只认「峰值受限」；衰减本就不可能被峰值挡，那时留个内部标记够排障用了
+          reasons.push(CFG.target - m.measuredI > 0 ? '峰值受限' : '峰值上限');
         }
       }
 
@@ -802,7 +805,6 @@
     return {
       install: install,
       isDummy: function (node) { return !!(node && node.__blnDummy); },
-      owns: function (el) { return claimed.has(el); },
       isInstalled: function () { return installed; },
       count: function () { return dummies; },
     };
@@ -816,8 +818,8 @@
     let master = null;
     let appliedDb = 0;
     let desiredDb = 0;
-    let bypass = false;
     let gestureArmed = false;
+    let warnedOccupied = false;
 
     const attached = new WeakSet();
     const failed = new WeakSet();
@@ -897,7 +899,13 @@
         if (SourceGuard.isDummy(src)) {
           failed.add(el);
           stats.failed++;
-          Log.warn('该 <video> 的音频源已被页面先占用 → 保持原声（B 站自己的音效在管）');
+          // 只在第一次说：轮询每 300ms 会反复走到这里，刷屏没有信息量
+          if (!warnedOccupied) {
+            warnedOccupied = true;
+            Log.warn('该 <video> 的音频源已被页面先占用 → 保持原声（B 站自己的音效在管）');
+          } else {
+            Log.debug('音频源仍被占用（已提示过）');
+          }
           return false;
         }
         src.connect(master);
@@ -915,7 +923,7 @@
     }
 
     function applyGain(immediate) {
-      const target = bypass ? 0 : desiredDb;
+      const target = desiredDb;
       if (!ctx || !master) return false;
       const linear = U.dbToLinear(target);
       try {
@@ -931,7 +939,7 @@
         }
         appliedDb = target;
         stats.gainSets++;
-        Log.info('施加增益 ' + U.fmtDb(target) + '（' + CFG.fadeMs + 'ms 淡变' + (bypass ? ' · 旁路' : '') + '）');
+        Log.info('施加增益 ' + U.fmtDb(target) + '（' + CFG.fadeMs + 'ms 淡变）');
         return true;
       } catch (e) {
         Log.warn('设置增益失败：' + (e && e.message));
@@ -948,14 +956,6 @@
         desiredDb = db;
         return applyGain(false);
       },
-      reapply: function () { return applyGain(false); },
-      setBypass: function (v) {
-        bypass = !!v;
-        applyGain(false);
-        return bypass;
-      },
-      toggleBypass: function () { return this.setBypass(!bypass); },
-      isBypass: function () { return bypass; },
       appliedDb: function () { return appliedDb; },
       desiredDb: function () { return desiredDb; },
       contextState: function () { return ctx ? ctx.state : null; },
@@ -964,7 +964,6 @@
           pending: pending.size,
           guard: SourceGuard.isInstalled(),
           dummies: SourceGuard.count(),
-          bypass: bypass,
         });
       },
     };
@@ -974,10 +973,40 @@
    * 页型与目标
    * ================================================================ */
   const Target = (() => {
+    /** 查询串（页面把 location.search 清掉时回落到 href，活动页换视频就是只改 URL） */
+    function pageQuery() {
+      try {
+        if (location.search) return String(location.search);
+      } catch (e) { /* 忽略 */ }
+      try {
+        const href = String(location.href || '');
+        const i = href.indexOf('?');
+        return i >= 0 ? href.slice(i) : '';
+      } catch (e) { return ''; }
+    }
+
+    /** 页面里能摸到的 bvid：查询串 → 路径 → SSR 初始状态 */
+    function pageBvid() {
+      let qs = null;
+      try { qs = new URLSearchParams(pageQuery()); } catch (e) { qs = null; }
+      const fromQuery = qs && (qs.get('bvid') || qs.get('bvid_extra'));
+      if (fromQuery && /^BV[0-9A-Za-z]+$/.test(fromQuery)) return fromQuery;
+
+      const m = String(location.pathname || '').match(/\/video\/(BV[0-9A-Za-z]+)/);
+      if (m) return m[1];
+
+      const st = PAGE.__INITIAL_STATE__;
+      const vd = st && (st.videoData || (st.videoInfo && st.videoInfo.videoData));
+      if (vd && typeof vd.bvid === 'string' && /^BV[0-9A-Za-z]+$/.test(vd.bvid)) return vd.bvid;
+      return null;
+    }
+
     function kind() {
-      const p = location.pathname;
+      const p = String(location.pathname || '');
       if (/^\/video\//.test(p)) return 'video';
       if (/^\/list\//.test(p)) return 'video';
+      // 活动页 /festival/...：里面的播放器同样走 DASH，bvid 在查询串里
+      if (/^\/festival\//.test(p)) return 'video';
       if (/^\/bangumi\/play\//.test(p)) return 'pgc';
       return null;
     }
@@ -987,24 +1016,17 @@
       if (!k) return null;
 
       if (k === 'video') {
-        const m = location.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/);
-        if (!m) {
-          // 列表页 /list/... 的 bvid 在查询串里
-          const qs2 = new URLSearchParams(location.search);
-          const bv = qs2.get('bvid');
-          if (!bv || !/^BV[0-9A-Za-z]+$/.test(bv)) return null;
-          const pp = Number(qs2.get('p') || 1) || 1;
-          return { kind: k, bvid: bv, p: pp, key: bv + ':p' + pp, label: bv + ' · P' + pp };
-        }
-        const qs = new URLSearchParams(location.search);
-        const p = Number(qs.get('p') || 1) || 1;
-        return { kind: k, bvid: m[1], p: p, key: m[1] + ':p' + p, label: m[1] + ' · P' + p };
+        const bv = pageBvid();
+        if (!bv) return null;
+        let p = 1;
+        try { p = Number(new URLSearchParams(pageQuery()).get('p') || 1) || 1; } catch (e) { p = 1; }
+        return { kind: k, bvid: bv, p: p, key: bv + ':p' + p, label: bv + ' · P' + p };
       }
 
-      const ep = (location.pathname.match(/\/ep(\d+)/) || [])[1];
+      const ep = (String(location.pathname || '').match(/\/ep(\d+)/) || [])[1];
       if (ep) return { kind: k, epId: Number(ep), key: 'ep:' + ep, label: 'ep' + ep };
 
-      const ss = (location.pathname.match(/\/ss(\d+)/) || [])[1];
+      const ss = (String(location.pathname || '').match(/\/ss(\d+)/) || [])[1];
       if (!ss) return null;
       const st = PAGE.__INITIAL_STATE__;
       const live = st && st.epInfo && st.epInfo.id;
@@ -1012,7 +1034,7 @@
       return { kind: k, seasonId: Number(ss), key: 'ss:' + ss, label: 'ss' + ss };
     }
 
-    return { kind: kind, resolve: resolve };
+    return { kind: kind, resolve: resolve, pageQuery: pageQuery };
   })();
 
   /* ================================================================
@@ -1021,7 +1043,8 @@
   const PlayInfo = (() => {
     const mem = {};
     const viewCache = {};
-    const EXCLUDE = [30250, 30251, 30280];
+    /* SSE / 环绕 / 空间音频这类 id 不能当分析对象；30280 是「音乐 / Hi-Res」，正是活动页与音乐稿的主轨，必须留着 */
+    const EXCLUDE = [30250, 30251];
 
     function memGet(key) {
       const c = mem[key];
@@ -1031,14 +1054,30 @@
 
     function pickAudio(dash) {
       if (!dash || !Array.isArray(dash.audio) || !dash.audio.length) return null;
-      const usable = dash.audio.filter(function (a) {
+      const hasIndex = function (a) {
         const sb = a.SegmentBase || a.segment_base || a.segmentBase || {};
-        return EXCLUDE.indexOf(a.id) === -1 && (sb.indexRange || sb.index_range) && (a.baseUrl || a.base_url);
+        return (sb.indexRange || sb.index_range) && (a.baseUrl || a.base_url);
+      };
+      let list = dash.audio.filter(function (a) {
+        return EXCLUDE.indexOf(a.id) === -1 && hasIndex(a);
       });
-      const list = usable.length ? usable : dash.audio;
+      // 只剩「没索引」的轨时也别丢：没有别的选择，先把能取到的那条用上
+      if (!list.length) {
+        list = dash.audio.filter(function (a) { return EXCLUDE.indexOf(a.id) === -1; });
+      }
+      if (!list.length) return null;
+
       let pick = null;
-      for (let i = 0; i < list.length; i++) if (list[i].id === 30232) { pick = list[i]; break; }
-      if (!pick) pick = list[0];
+      // 优先要 B 站测过响度的那一档（30232），其次 Hi-Res / 音乐轨（30280），最后才回落到第一条
+      const PREF = [30232, 30280];
+      for (let k = 0; k < PREF.length && !pick; k++) {
+        for (let i = 0; i < list.length; i++) if (list[i].id === PREF[k]) { pick = list[i]; break; }
+      }
+      if (!pick) {
+        // 没有首选档（30216 低码率 / 30250 等）时退回第一条可用轨，
+        // 不能把 dash.audio[0]（可能正是被排除的那条）拿回来
+        pick = list[0];
+      }
 
       const sb = pick.SegmentBase || pick.segment_base || pick.segmentBase || {};
       return {
@@ -1068,23 +1107,21 @@
       return Math.abs(el.duration - info.duration) <= CFG.waitTolerance + 1;
     }
 
-    function fromVideoData(data, origin) {
+    function fromVideoData(data) {
       const dash = data.dash;
-      if (!dash) {
-        if (data.durl) throw new Error('该视频只有 durl 流，无法抽样');
-        throw new Error('响应里没有 dash');
-      }
+      // 未付费的充电专属视频只给 mp4 整包（durl，约 180s 试看），没有 DASH 音轨。
+      // 这条只在 readVideoPage 里被 try 掉，真正的报错由 get() 统一给出。
+      if (!dash) throw new Error('该视频没有 DASH 音轨');
       const audio = pickAudio(dash);
       if (!audio) throw new Error('没有可用的音频轨');
       return {
         duration: Number(dash.duration) || Number(data.timelength) / 1000 || 0,
         audio: audio,
         meta: pickMeta(data.volume),
-        origin: origin,
       };
     }
 
-    function fromPgcData(res, origin) {
+    function fromPgcData(res) {
       if (!res) throw new Error('番剧接口返回为空');
       const vi = res.video_info || {};
       const dash = res.dash || vi.dash;
@@ -1095,21 +1132,21 @@
         duration: Number(dash.duration) || Number(vi.duration) || 0,
         audio: audio,
         meta: pickMeta(vi.volume),
-        origin: origin,
       };
     }
 
     function readVideoPage() {
       const pi = PAGE.__playinfo__;
-      if (!pi || !pi.data || !pi.data.dash) return null;
-      try { return fromVideoData(pi.data, 'page'); } catch (e) { return null; }
+      if (!pi || !pi.data) return null;
+      if (!pi.data.dash && !pi.data.durl) return null;
+      try { return fromVideoData(pi.data); } catch (e) { return null; }
     }
 
     function readPgcPage() {
       const pi = PAGE.__playinfo__;
       if (!pi) return null;
       const res = pi.result || pi.data || pi;
-      try { return fromPgcData(res, 'page'); } catch (e) { return null; }
+      try { return fromPgcData(res); } catch (e) { return null; }
     }
 
     async function view(bvid) {
@@ -1151,11 +1188,25 @@
 
     function ssrUrl(target) {
       if (target.kind === 'pgc') {
+        // 永远按当前这一集的 ep 地址回读：/ss 的当前页只带第一集，换集后就是别人的数据
         if (target.epId) return 'https://www.bilibili.com/bangumi/play/ep' + target.epId;
-        return location.href;
+        return String(location.href || '');
       }
-      const p = target.p > 1 ? '?p=' + target.p : '';
-      return 'https://www.bilibili.com/video/' + target.bvid + p;
+      // 读者所在的落地页 URL（去掉 p 之类的选集参数），活动页 /festival/… 也按它自己的地址回读
+      let here = '';
+      try { here = String(location.origin || '') + String(location.pathname || ''); } catch (e) { here = ''; }
+      const l = Target.pageQuery();
+      const p = Number((/(?:^|[?&])p=(\d+)/.exec(l) || [])[1] || 1);
+      if (here) {
+        const cur = String(location.href || '');
+        // 当前页本来就是这一集：直接读当前页。活动页的 __playinfo__ 只在它自己的 SSR 里，
+        // 重开 /video/ 落地页拿到的是另一套（常常连 volume 都没有）
+        if (p === target.p) return cur || here;
+        // 选集后的「同一张视频另一集」也走这里：/video/BVxxxx?p=N 的 SSR 就是这一集的
+        return here + '?p=' + target.p;
+      }
+      const q = target.p > 1 ? '?p=' + target.p : '';
+      return 'https://www.bilibili.com/video/' + target.bvid + q;
     }
 
     /** 从 start（指向 '{'）开始做括号配对，返回完整 JSON 文本 */
@@ -1264,8 +1315,17 @@
 
         const cid = await cidOf(target);
         if (!cid) throw new Error('拿不到 cid');
-        const info = fromVideoData(await fetchVideoPlayurl(target, cid), 'api');
-        if (!info.meta) info.meta = await ssrMeta(target, info);   // 接口没有，回读该集 SSR
+        const data = await fetchVideoPlayurl(target, cid);
+        // 未付费的充电专属视频只给 mp4 试看整包：没有 DASH 音轨、没有官方响度，
+        // 既不能按整片测也不能便宜地测，直接如实报错（不做降级的「试看段」测量）
+        if (!data.dash) {
+          throw new Error(data.durl && data.durl.length
+            ? '充电专属未付费'
+            : '响应里既没有 DASH 也没有 durl');
+        }
+        const info = fromVideoData(data);
+        // 接口里的 volume 为空时不在这儿回读 SSR —— 由 Analyzer 统一问一次官方响度，
+        // 那边既能带上时长做校验，也不会在一次分析里连拉两遍整页
         memPut(target.key, info);
         return info;
       }
@@ -1281,8 +1341,8 @@
       const res = (j && (j.result || (j.data && j.data.result))) || j;
       if (!res) throw new Error('番剧接口失败 code=' + (j && j.code));
       if (res.error_code) throw new Error('番剧接口错误 ' + res.error_code + ' ' + (res.message || ''));
-      const info = fromPgcData(res, 'api');
-      if (!info.meta) info.meta = await ssrMeta(target, info);     // 番剧接口永远不带元数据
+      const info = fromPgcData(res);
+      // 番剧接口永远不带元数据，SSR 由 Analyzer 统一问，这里不再自己拉一遍
       memPut(target.key, info);
       return info;
     }
@@ -1292,7 +1352,7 @@
       pickAudio: pickAudio,
       pickMeta: pickMeta,
       /** 只问官方要一次元数据（不看缓存、不写负缓存），给「本地值升级成官方值」用 */
-      officialMeta: function (target) { return ssrMeta(target, null, { force: true }); },
+      officialMeta: function (target, info) { return ssrMeta(target, info || null, { force: true }); },
     };
   })();
 
@@ -1304,7 +1364,6 @@
     let queued = null;
     let currentKey = null;
     let lastMeta = null;
-    let lastInfo = null;
 
     const status = {
       state: 'idle',
@@ -1414,11 +1473,10 @@
         if (!Number.isFinite(integrated)) return null;
         return {
           i: integrated,
-          // 抽到的只是样点峰值，真峰值会更高；留 0.7dB 余量再去算峰值预算
+          // 抽到的只是样点峰值，真峰值会更高；留 0.7dB 余量再去算峰值上限
           tp: peakDb === -Infinity ? null : U.round(peakDb + 0.7, 2),
           segments: done,
           total: picked.length,
-          blocks: blocks.length,
         };
       }
 
@@ -1551,10 +1609,30 @@
           source = 'cache';
           srcType = meta.src || 'sample';
           set({ text: '命中缓存', cached: true, metaSrc: srcType });
+          // 缓存里是本地抽样值：先去问一次官方响度。选集来回切时最容易踩这个坑 ——
+          // 早先本地算过一次就一直「命中缓存」，永远不再看 B 站到底测没测。
+          if (srcType !== 'meta' && CFG.ssrMeta) {
+            set({ text: '查官方响度…', pct: 8 });
+            const official = await PlayInfo.officialMeta(target, meta.d ? { duration: meta.d } : null);
+            if (official) {
+              Store.dropMeta(target.key);
+              Store.putMeta(target.key, official.i, official.tp, meta.d || null, 'meta');
+              meta = { i: official.i, tp: official.tp, d: meta.d || null, src: 'meta' };
+              srcType = 'meta';
+              source = 'meta';
+              set({ backup: '已换成 B 站官方值' });
+              Log.info('缓存里的本地值换成 B 站官方值');
+            }
+          }
         } else {
           set({ text: '读取流信息…', pct: 5 });
           info = await PlayInfo.get(target, el);
-          lastInfo = info;
+          // 有些集数接口不带 volume，但那一集的页面 SSR 是带官方响度的：
+          // 先问官方，问不到（或者缓存里就是官方值）才走本地抽样
+          if (!info.meta && CFG.ssrMeta) {
+            set({ text: '查官方响度…', pct: 8 });
+            info.meta = await PlayInfo.officialMeta(target, info);
+          }
           if (info.meta) {
             meta = { i: info.meta.i, tp: info.meta.tp };
             source = 'meta';
@@ -1665,7 +1743,9 @@
         }
 
         upgradeTries++;
-        PlayInfo.officialMeta(target).then(function (official) {
+        // 带上缓存里记的时长，SSR 那边才能验「这一页是不是这一集」
+        const before = Store.getMeta(upgradeKey);
+        PlayInfo.officialMeta(target, before && before.d ? { duration: before.d } : null).then(function (official) {
           if (!official) {
             if (upgradeTries < 2) upgradeTimer = setTimeout(attempt, CFG.upgradeRetryMs);
             return;
@@ -1750,7 +1830,7 @@
   /* ================================================================
    * 界面
    * ================================================================ */
-const UI = (() => {
+  const UI = (() => {
     let host = null;        // 面板本体：挂在「响」按钮里的 light DOM，皮肤全用播放器自带的 bui 组件
     let toastEl = null;
     let toastTimer = null;
@@ -1761,21 +1841,21 @@ const UI = (() => {
     let lastOrder = null;
     const refs = {};
 
-    const BTN_TITLE = '响度均衡';
     const PANEL_ID = 'bln-menu-host';
     const TOAST_ID = 'bln-toast';
+    /* 控制栏按钮的命中选择器：不用 title，免得按钮带原生 tooltip */
+    const BTN_SEL = '.bpx-player-ctrl-btn[data-bln-btn]';
 
-    /* 控制栏按钮：节点结构和原生一模一样，只有 order 用样式表下发 */
+    /* 控制栏按钮：节点结构和原生一模一样，只有 order 用样式表下发；不设 cursor —— 光标交给播放器自己 */
     const CTRL_CSS = [
-      '.bpx-player-ctrl-btn[title="' + BTN_TITLE + '"]{cursor:pointer;user-select:none;',
-      '-webkit-user-select:none}',
+      BTN_SEL + '{user-select:none;-webkit-user-select:none}',
     ].join('');
 
     /* 面板：外形全部来自 B 站自己的 .bui-panel / .bui-radio / .bpx-player-ctrl-setting-menu-right，
        这里只补排版（宽度、行距、按钮文字），不重画任何控件的配色和形状。 */
     const PANEL_CSS = [
       '#' + PANEL_ID + '{position:absolute;left:50%;z-index:10;display:none;width:240px;',
-      'transform:translateX(-50%);font-size:12px;line-height:22px;color:#fff;text-align:left;',
+      'transform:translateX(-50%);font-size:12px;line-height:22px;text-align:left;',
       'font-family:inherit;overflow-y:auto}',
       '#' + PANEL_ID + '.bln-show{display:block}',
       '#' + PANEL_ID + ' .bpx-player-ctrl-setting-menu-right{padding:12px 16px}',
@@ -1785,23 +1865,28 @@ const UI = (() => {
       '#' + PANEL_ID + ' .bln-dot.run{background:#f0b429;animation:bln-blink 1s infinite}',
       '#' + PANEL_ID + ' .bln-dot.err{background:#ff5f56}',
       '@keyframes bln-blink{50%{opacity:.35}}',
-      '#' + PANEL_ID + ' .bln-name{font-size:13px;flex:none;white-space:nowrap}',
-      '#' + PANEL_ID + ' .bln-gain{margin-left:auto;font-size:13px;font-variant-numeric:tabular-nums;',
-      'flex:none;white-space:nowrap}',
-      '#' + PANEL_ID + ' .bln-src{flex:none;color:#8fd0ea;white-space:nowrap}',
-      '#' + PANEL_ID + ' .bln-link{flex:none;background:none;border:0;color:#fff;font-size:12px;',
+      '#' + PANEL_ID + ' .bln-name{flex:none;white-space:nowrap}',
+      '#' + PANEL_ID + ' .bln-gain{margin-left:auto;display:flex;align-items:baseline;gap:4px;',
+      'font-size:13px;font-variant-numeric:tabular-nums;flex:none;white-space:nowrap}',
+      '#' + PANEL_ID + ' .bln-src{flex:none;white-space:nowrap;color:var(--bpx-primary-color,#00a1d6)}',
+      '#' + PANEL_ID + ' .bln-link{flex:none;margin-left:auto;background:none;border:0;font-size:12px;',
       'padding:0;cursor:pointer;font-family:inherit;white-space:nowrap}',
       '#' + PANEL_ID + ' .bln-link:hover{opacity:.75}',
       '#' + PANEL_ID + ' .bln-line{display:flex;align-items:center;gap:4px;line-height:24px;',
       'white-space:nowrap}',
-      '#' + PANEL_ID + ' .bln-k{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}',
-      '#' + PANEL_ID + ' .bln-v{flex:none;font-variant-numeric:tabular-nums}',
-      '#' + PANEL_ID + ' .bln-v b{font-weight:400}',
-      '#' + PANEL_ID + ' .bln-v i{font-style:normal;opacity:.6;margin:0 3px}',
-      '#' + PANEL_ID + ' em{font-style:normal;font-size:11px;opacity:.8;flex:none}',
+      '#' + PANEL_ID + ' .bln-k{flex:none;white-space:nowrap}',
+      // 第二行右半部分整体居右：说明文居左，数值组（原始 → 实际 LUFS [限]）居右。
+      // 和上一行的 .bln-gain 用同一套 flex + gap，五个元素之间的间隔完全一致
+      '#' + PANEL_ID + ' .bln-v{margin-left:auto;flex:none;display:flex;align-items:baseline;gap:4px;',
+      'white-space:nowrap;font-variant-numeric:tabular-nums}',
+      // 箭头和实际值是一个整体，内部也用同样的 4px，五个元素的间隔才齐
+      '#' + PANEL_ID + ' #bln-goal{display:inline-flex;align-items:baseline;gap:4px}',
+      '#' + PANEL_ID + ' .bln-v i{font-style:normal}',
       '#' + PANEL_ID + ' .bln-title{margin:6px 0 4px;line-height:16px;font-size:12px}',
-      '#' + PANEL_ID + ' .bln-gap{height:6px}',
+      '#' + PANEL_ID + ' .bln-gap{height:14px}',
       '#' + PANEL_ID + ' .bln-hide{display:none!important}',
+      // 报错时第二行整行换成原因文字，允许换行，别把面板撑破
+      '#' + PANEL_ID + ' .bln-err{white-space:normal;font-size:12px;line-height:18px}',
       '#' + TOAST_ID + '{position:absolute;left:50%;bottom:82px;transform:translateX(-50%);',
       'background:rgba(20,20,20,.9);color:#fff;padding:6px 12px;border-radius:4px;font-size:12px;',
       'line-height:18px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:20;',
@@ -1835,15 +1920,18 @@ const UI = (() => {
       return ''
         + '<div class="bui bui-panel bui-dark">'
         + '  <div class="bpx-player-ctrl-setting-menu-right">'
-        + '    <div class="bln-head"><span class="bln-dot" id="bln-dot"></span>'
-        + '      <span class="bln-name">响度增益</span>'
-        + '      <span class="bln-gain" id="bln-gain">—</span>'
-        + '      <span class="bln-src" id="bln-src">[—]</span>'
-        + '      <button class="bln-link" id="bln-remeasure">重新获取</button></div>'
-        + '    <div class="bln-line"><span class="bln-k" id="bln-st">等待视频</span>'
-        + '      <span class="bln-v"><b id="bln-meas">—</b><span id="bln-goal">'
-        + '<i>→</i><span id="bln-tgt">—</span></span></span>'
-        + '      <em id="bln-unit">LUFS</em></div>'
+        + '    <div class="bln-head"><span class="bln-name">响度增益</span>'
+        + '<span class="bln-dot" id="bln-dot"></span>'
+        + '<span class="bln-gain" id="bln-gain"><span id="bln-gain-val">—</span>'
+        + '<span id="bln-gain-unit">dB</span></span>'
+        + '<span class="bln-src" id="bln-src">[—]</span></div>'
+        + '    <div class="bln-line">'
+        + '      <span class="bln-k" id="bln-st">等待视频</span>'
+        + '      <span class="bln-v" id="bln-v"><span id="bln-meas">—</span>'
+        + '<span id="bln-goal"><i>→</i><span id="bln-tgt">—</span></span>'
+        + '<span id="bln-meas-unit">LUFS</span>'
+        + '<span id="bln-meas-tag"></span></span>'
+        + '    </div>'
         + '    <div class="bln-title">预设</div>'
         + presetRows()
         + '    <div class="bln-line" style="margin-top:6px">'
@@ -1894,7 +1982,7 @@ const UI = (() => {
           if (s.color && s.color !== 'rgba(0, 0, 0, 0)' && s.color !== 'transparent') d.color = s.color;
         }
       } catch (e) { /* 用默认值 */ }
-      return '.bpx-player-ctrl-btn[title="' + BTN_TITLE + '"] .bpx-player-ctrl-playbackrate-result{'
+      return BTN_SEL + ' .bpx-player-ctrl-playbackrate-result{'
         + 'font-size:' + d.size + ';line-height:' + d.line + ';font-family:' + d.family
         + ';color:' + d.color + ';-webkit-text-fill-color:currentColor;padding:0;margin:0;'
         + 'white-space:nowrap;opacity:1;visibility:visible}';
@@ -1911,7 +1999,7 @@ const UI = (() => {
         if (head) head.appendChild(style);
       }
       style.textContent = CTRL_CSS + PANEL_CSS
-        + (order ? '.bpx-player-ctrl-btn[title="' + BTN_TITLE + '"]{order:' + order + '}' : '')
+        + (order ? BTN_SEL + '{order:' + order + '}' : '')
         + (textCss || '');
       lastOrder = key;
     }
@@ -1919,7 +2007,9 @@ const UI = (() => {
     function makeButton() {
       const el = document.createElement('div');
       el.className = 'bpx-player-ctrl-btn';
-      el.title = BTN_TITLE;
+      // 不设 title / aria-label：悬停只弹面板，不弹「响度均衡」这种原生提示框。
+      // 也就不用 title 当选择器，改用 data-bln-btn 标记（样式表和 ensureButton 都靠它）。
+      el.setAttribute('data-bln-btn', '');
       el.setAttribute('role', 'button');
       el.setAttribute('tabindex', '0');
 
@@ -2000,7 +2090,7 @@ const UI = (() => {
 
     /**
      * 控制栏靠 flex order 排序，order 必须跟倍速一致；
-     * 用样式表下发（按 title 命中），保证按钮节点上没有内联样式。
+     * 用样式表下发（按 [data-bln-btn] 命中），保证按钮节点上没有内联样式，也不带 title。
      */
     function styleButton(rate) {
       let order = null;
@@ -2024,11 +2114,15 @@ const UI = (() => {
         refs.dot = q('bln-dot');
         refs.st = q('bln-st');
         refs.meas = q('bln-meas');
+        refs.vGroup = q('bln-v');
+        refs.measUnit = q('bln-meas-unit');
+        refs.measTag = q('bln-meas-tag');
+        refs.gainVal = q('bln-gain-val');
+        refs.gainUnit = q('bln-gain-unit');
         refs.tgt = q('bln-tgt');
         refs.goal = q('bln-goal');
         refs.gain = q('bln-gain');
         refs.src = q('bln-src');
-        refs.remeasure = q('bln-remeasure');
         refs.cache = q('bln-cache');
         refs.clear = q('bln-clear');
         refs.preset = {};
@@ -2180,31 +2274,58 @@ const UI = (() => {
       if (!host) return;
       const st = s || Analyzer.status;
       const off = !CFG.enabled || st.state === 'off';
+      const failed = !off && st.state === 'error';
       const reasons = st.reasons || [];
 
-      // 第二行永远是「当前响度」这个说法；关掉时只是不画目标，标题行已经写了「已关闭」
+      // 报错时：第一行数值换成 error（单位与 [官]/[本] 一起收起），第二行的数值组整块不显示，
+      // 说明文换成报错原因
+      if (failed) {
+        refs.st.textContent = (st.text || '分析失败').replace(/^.*?：/, '');
+        refs.st.classList.add('bln-err');
+        refs.vGroup.classList.add('bln-hide');
+        refs.gainVal.textContent = 'error';
+        refs.gainUnit.classList.add('bln-hide');
+        if (refs.src) refs.src.textContent = '';
+        refs.dot.className = 'bln-dot err';
+        if (refs.gain && refs.gain.hasAttribute('title')) refs.gain.removeAttribute('title');
+        return;
+      }
+      if (refs.st.classList.contains('bln-err')) refs.st.classList.remove('bln-err');
+
+      // 第二行永远是「当前响度」这个说法；关掉时只是不画数值，标题行已经写了「已关闭」
       refs.st.textContent = off ? '当前响度'
         : (st.progress ? st.text + ' ' + st.progress : st.text);
-      refs.meas.textContent = Number.isFinite(st.i) ? st.i.toFixed(1) : '—';
-      refs.tgt.textContent = String(CFG.target);
-      refs.gain.textContent = off ? '已关闭'
-        : (Number.isFinite(st.gain) ? U.fmtDb(st.gain) : '—');
+
+      // 第二行的数值组永远是「原始 → 实际 LUFS [限]」，单位画在实际值后面、[限] 前面：
+      //   -16.0 → -14.0 LUFS      （增益 +2.0 dB）
+      //   -16.0 → -16.0 LUFS [限]（峰值挡住，一点没提上去）
+      //   -10.0 → -14.0 LUFS      （衰减）
+      // 单位、箭头、[限] 都是常驻节点，只改文字不改显隐，位置不会跳。
+      refs.goal.classList.remove('bln-hide');
+      const hasI = !off && Number.isFinite(st.i);
+      // 还没测出数（读取中 / 采样中 / 已关闭）时整组隐藏，不画「— LUFS」
+      refs.vGroup.classList.toggle('bln-hide', !hasI);
+      const actual = hasI && Number.isFinite(st.gain) ? U.round(st.i + st.gain, 1) : null;
+      refs.meas.textContent = hasI ? st.i.toFixed(1) : '';
+      refs.measUnit.textContent = 'LUFS';
+      refs.tgt.textContent = actual === null ? '' : actual.toFixed(1);
+      // 只有「想提没提上去」才挂 [限]
+      const limited = hasI && reasons.indexOf('峰值受限') >= 0;
+      refs.measTag.textContent = limited ? '[限]' : '';
+      // 「已关闭」时数值与单位都收起，只剩这几个字
+      const gainText = off ? '已关闭' : (Number.isFinite(st.gain) ? U.fmtDbNum(st.gain) : '—');
+      refs.gainVal.textContent = gainText;
+      refs.gainUnit.classList.toggle('bln-hide', off);
+      // 首行的间距由 bln-head 的 flex 布局给；面板上只有 [官]/[本] 带色（var(--bpx-primary-color)），其余文字用播放器自己的颜色
+      if (refs.src) refs.src.textContent = off ? '' : (st.metaSrc === 'meta' ? '[官]' : '[本]');
 
       refs.dot.className = 'bln-dot';
       if (st.state === 'applied') refs.dot.classList.add('ok');
       else if (st.state === 'error') refs.dot.classList.add('err');
       else if (st.state === 'run') refs.dot.classList.add('run');
 
-      const official = st.metaSrc === 'meta';
-      if (refs.src) {
-        refs.src.textContent = off ? '' : (official ? '[官]' : '[本]');
-        refs.src.style.color = official ? '#8fd0ea' : '#fff';
-      }
-      // 限幅原因不摆在面板上（提升被峰值挡住是常态），挂成悬停提示
-      refs.gain.title = (!off && reasons.length) ? reasons.join('、') : '';
-      // 关掉时：目标箭头、重新获取一起收起来
-      refs.goal.classList.toggle('bln-hide', off);
-      refs.remeasure.classList.toggle('bln-hide', off);
+      // 限幅原因不挂在任何 title 上，免得鼠标停一下冒出一行提示
+      if (refs.gain && refs.gain.hasAttribute('title')) refs.gain.removeAttribute('title');
     }
 
     function bind() {
@@ -2229,12 +2350,6 @@ const UI = (() => {
       window.addEventListener('resize', function () { if (open) placeMenu(); });
       document.addEventListener('fullscreenchange', function () { if (open) placeMenu(); });
 
-      refs.remeasure.addEventListener('click', function (e) {
-        e.stopPropagation();
-        toast('重新获取本视频响度…');
-        Analyzer.reanalyze();
-      });
-
       Object.keys(refs.preset).forEach(function (k) {
         refs.preset[k].addEventListener('change', function () { applyPreset(k); });
       });
@@ -2258,7 +2373,6 @@ const UI = (() => {
       toast: toast,
       syncControls: syncControls,
       isOpen: function () { return open; },
-      close: function () { setOpen(false); },
     };
   })();
 
@@ -2387,28 +2501,11 @@ const UI = (() => {
           Analyzer.setStatus({ state: 'off', text: '已关闭' });
         }
       });
-      GM_registerMenuCommand('旁路开关（Shift+B）', function () {
-        const on = Engine.toggleBypass();
-        UI.toast(on ? '旁路：听原声' : '恢复均衡增益');
-        UI.render();
-      });
       GM_registerMenuCommand('清空测量缓存', function () {
         Store.clear();
         UI.toast('缓存已清空');
       });
     } catch (e) { Log.debug('菜单注册失败'); }
-  }
-
-  function registerHotkey() {
-    document.addEventListener('keydown', function (ev) {
-      if (!ev.shiftKey || ev.altKey || ev.ctrlKey || ev.metaKey) return;
-      if (String(ev.key || '').toLowerCase() !== 'b') return;
-      const t = ev.target;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-      const on = Engine.toggleBypass();
-      UI.toast(on ? '旁路：听原声' : '恢复均衡增益');
-      UI.render();
-    }, true);
   }
 
   function expose() {
@@ -2421,7 +2518,6 @@ const UI = (() => {
           context: Engine.contextState(),
           gainApplied: Engine.appliedDb(),
           gainDesired: Engine.desiredDb(),
-          bypass: Engine.isBypass(),
           video: (function () {
             const el = Lifecycle.currentElement();
             if (!el) return null;
@@ -2439,12 +2535,6 @@ const UI = (() => {
       },
       reanalyze: function () { Analyzer.reanalyze(); },
       reapply: function () { return Analyzer.reapply(); },
-      setEnabled: function (v) {
-        CFG.enabled = v !== false;
-        Store.saveSettings();
-        UI.syncControls();
-        if (CFG.enabled) { Lifecycle.start(); void Lifecycle.tick('api'); } else Engine.setGainDb(0);
-      },
       /** 切预设：standard / dynamic / headphone / speaker / night；传 'off' 等于关闭 */
       preset: function (k) {
         if (k === 'off') { CFG.enabled = false; Store.saveSettings(); UI.syncControls(); Engine.setGainDb(0); return true; }
@@ -2466,11 +2556,6 @@ const UI = (() => {
         Store.saveSettings();
         UI.syncControls();
         return Analyzer.reapply();
-      },
-      bypass: function (v) {
-        const on = Engine.setBypass(v === undefined ? !Engine.isBypass() : v);
-        UI.render();
-        return on;
       },
       cache: {
         stats: function () { return Store.stats(); },
@@ -2513,12 +2598,11 @@ const UI = (() => {
     Lifecycle.start();
 
     registerMenu();
-    registerHotkey();
-    expose();
 
     Log.info('就绪 · ' + kind + ' · 目标 ' + CFG.target + ' LUFS');
   }
 
+  // 先挂 __bln 再启动：哪怕 boot 中途出错，控制台也能拿到接口排障
   expose();
   try {
     boot();
