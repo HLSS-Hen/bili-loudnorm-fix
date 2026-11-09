@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         响度均衡
 // @namespace    bili-loudnorm
-// @version      1.1.1
+// @version      1.2.0
 // @description  测量整段视频的响度，按需施加一个固定增益，拉齐 B 站连播时忽大忽小的音量。不压缩原声、不干预播放器；覆盖普通投稿、多 P、番剧影视选集。
 // @license      MIT
 // @match        https://www.bilibili.com/video/*
@@ -52,21 +52,28 @@
    * 配置
    * ================================================================ */
   const CFG = {
-    enabled: true,
-    target: -14,          // 目标响度 LUFS
-    maxBoost: 12,         // 最大提升 dB
+    target: -14,          // 目标响度 LUFS（由预设决定）
+    maxBoost: 16,         // 最大提升 dB
     minGain: -60,         // 最大衰减 dB
-    preset: 'standard',   // 当前预设：standard / dynamic / headphone / speaker / night（custom = 用 API 直接改过目标）
+    preset: 'normal',     // 当前预设：loud / normal / quiet（对齐 Spotify 三档）
     ceiling: -1.0,        // 峰值余量上限 dBFS（留一点真峰值空间）
+    /* 「响亮」档的限幅器：阈值比 Spotify 的 -1 dBFS 再收 1 dB，给真峰值留余量 */
+    limiter: {
+      threshold: -2.0,
+      knee: 0,
+      ratio: 20,
+      attack: 0.005,      // 与 Spotify Loud 一致
+      release: 0.1,       // 与 Spotify Loud 一致
+    },
     fadeMs: 100,          // 增益切换的淡入淡出时长（ms）
     partialIntervalMs: 500, // 抽样期间的最小计算间隔：到点就重算一次
     partialDeadbandDb: 0.2, // 预估增益变化小于它就不重复落位，避免抖动
+    /* 三档目标对齐 Spotify：Loud -11 / Normal -14 / Quiet -19。
+       只有「响亮」档忽略峰值预算并启用限幅，其余两档仍受头部余量约束。 */
     presets: {
-      standard: { label: '标准', target: -14, maxBoost: 12 },
-      dynamic: { label: '高动态', target: -24, maxBoost: 12 },
-      night: { label: '深夜', target: -20, maxBoost: 6 },
-      headphone: { label: '耳机', target: -16, maxBoost: 12 },
-      speaker: { label: '外放', target: -11, maxBoost: 10 },
+      loud: { label: '响亮', target: -11, maxBoost: 16, limiter: true },
+      normal: { label: '标准', target: -14, maxBoost: 16 },
+      quiet: { label: '安静', target: -19, maxBoost: 16 },
     },
     sampleSegments: 12,   // 等距抽几段
     concurrency: 4,
@@ -191,22 +198,40 @@
 
     function index() { return read(K_IDX, {}) || {}; }
 
+    /* 旧版五档 + 「关闭」到新版三档的映射；旧配置不该把用户打回默认 */
+    const LEGACY_PRESET = {
+      standard: 'normal', headphone: 'normal',
+      dynamic: 'quiet', night: 'quiet', off: 'normal', custom: 'normal',
+      speaker: 'loud',
+    };
+
+    function usePreset(name) {
+      const p = CFG.presets[name];
+      if (!p) return false;
+      CFG.target = p.target;
+      CFG.maxBoost = p.maxBoost;
+      return true;
+    }
+
     /**
      * 预设归一：认识的直接用它的参数（预设是死数，以它为准）；
-     * 旧配置里没存预设的，按目标响度 + 提升上限反推；都对不上就是 custom。
+     * 旧配置里的五档按 LEGACY_PRESET 迁移；连名字都没有的，按目标响度就近归类。
      */
-    function pickPreset(name, target, maxBoost) {
+    function pickPreset(name, target) {
       if (name && CFG.presets[name]) {
-        CFG.target = CFG.presets[name].target;
-        CFG.maxBoost = CFG.presets[name].maxBoost;
+        usePreset(name);
         return name;
       }
-      const keys = Object.keys(CFG.presets);
-      for (let i = 0; i < keys.length; i++) {
-        const p = CFG.presets[keys[i]];
-        if (Math.abs(p.target - target) < 0.01 && Math.abs(p.maxBoost - maxBoost) < 0.01) return keys[i];
-      }
-      return 'custom';
+      const legacy = name && LEGACY_PRESET[name];
+      if (legacy && usePreset(legacy)) return legacy;
+      let best = 'normal';
+      let bestD = Infinity;
+      Object.keys(CFG.presets).forEach(function (k) {
+        const d = Math.abs(CFG.presets[k].target - (Number.isFinite(target) ? target : CFG.target));
+        if (d < bestD) { bestD = d; best = k; }
+      });
+      usePreset(best);
+      return best;
     }
 
     /** 删一条：正文 + 索引一起删，别留死条目 */
@@ -248,17 +273,12 @@
       loadSettings: function () {
         const s = read(K_SET, null);
         if (!s) return;
-        if (typeof s.enabled === 'boolean') CFG.enabled = s.enabled;
         if (Number.isFinite(s.minGain)) CFG.minGain = s.minGain;
         const t = Number.isFinite(s.target) ? s.target : CFG.target;
-        const b = Number.isFinite(s.maxBoost) ? s.maxBoost : CFG.maxBoost;
-        CFG.target = t;
-        CFG.maxBoost = b;
-        CFG.preset = pickPreset(s.preset, t, b);
+        CFG.preset = pickPreset(s.preset, t);
       },
       saveSettings: function () {
         write(K_SET, {
-          enabled: CFG.enabled,
           preset: CFG.preset,
           target: CFG.target,
           maxBoost: CFG.maxBoost,
@@ -709,22 +729,24 @@
   const GainPlan = (() => {
     /**
      * @param {{measuredI:number, truePeak:number}} m
-     * @returns {{gainDb:number, reasons:string[]}}
+     * @returns {{gainDb:number, reasons:string[], limiter:boolean}}
      */
     function plan(m) {
       const reasons = [];
       // 响度不可能是正数；B 站对没测过的视频填 0.001 占位，也一并挡掉
       if (!Number.isFinite(m.measuredI) || m.measuredI <= -70 || m.measuredI > 0) {
-        return { gainDb: 0, reasons: ['无有效响度'] };
+        return { gainDb: 0, reasons: ['无有效响度'], limiter: false };
       }
 
+      const preset = CFG.presets[CFG.preset];
+      const limiter = !!(preset && preset.limiter) && !CFG.limiter.disabled;
       let gain = CFG.target - m.measuredI;
 
       if (gain > CFG.maxBoost) { gain = CFG.maxBoost; reasons.push('提升上限'); }
       if (gain < CFG.minGain) { gain = CFG.minGain; reasons.push('衰减下限'); }
 
-      if (Number.isFinite(m.truePeak)) {
-        // 峰值上限只能「挡住提升」，绝不因为峰值高就把声音压小
+      if (!limiter && Number.isFinite(m.truePeak)) {
+        // 标准 / 安静档：峰值上限只能「挡住提升」，绝不因为峰值高就把声音压小
         const budget = Math.max(0, CFG.ceiling - m.truePeak);
         if (gain > budget) {
           gain = budget;
@@ -733,7 +755,7 @@
         }
       }
 
-      return { gainDb: U.round(gain, 2), reasons: reasons };
+      return { gainDb: U.round(gain, 2), reasons: reasons, limiter: limiter };
     }
 
     return { plan: plan };
@@ -816,6 +838,9 @@
   const Engine = (() => {
     let ctx = null;
     let master = null;
+    let limiter = null;      // 只在「响亮」档接进链路；其余档 master 直连 destination
+    let limiting = false;
+    let limiterWired = false; // limiter → destination 只接一次，之后靠 master 换线
     let appliedDb = 0;
     let desiredDb = 0;
     let gestureArmed = false;
@@ -834,14 +859,48 @@
         ctx = new Ctor();
         master = ctx.createGain();
         master.gain.value = 1;
-        master.connect(ctx.destination);
+        if (typeof ctx.createDynamicsCompressor === 'function') {
+          limiter = ctx.createDynamicsCompressor();
+          limiter.threshold.value = CFG.limiter.threshold;
+          limiter.knee.value = CFG.limiter.knee;
+          limiter.ratio.value = CFG.limiter.ratio;
+          limiter.attack.value = CFG.limiter.attack;
+          limiter.release.value = CFG.limiter.release;
+        } else {
+          // 极老的实现没有这个节点：不接限幅器，响亮档退回「受峰值预算约束」
+          CFG.limiter.disabled = true;
+          limiting = false;
+          Log.warn('浏览器不支持 DynamicsCompressorNode，响亮档退化为峰值预算');
+        }
+        wire();                    // 按当前预设决定走不走限幅器
         Log.debug('AudioContext 就绪 · state=' + ctx.state + ' · ' + ctx.sampleRate + 'Hz');
       } catch (e) {
         Log.error('AudioContext 创建失败', e);
         ctx = null;
         master = null;
+        limiter = null;
+        limiterWired = false;
       }
       return ctx;
+    }
+
+    /**
+     * 只在切预设时改一次接线：
+     *   响亮     master → limiter → destination（限幅器自带 6 ms look-ahead）
+     *   标准/安静 master → destination       （不经过限幅器，零额外延迟）
+     * 断的只是脚本自己的 master，<video> 的 source 永远不动。
+     */
+    function wire() {
+      if (!ctx || !master) return;
+      try { master.disconnect(); } catch (e) { /* 忽略 */ }
+      if (limiting && limiter) {
+        if (!limiterWired) {
+          try { limiter.connect(ctx.destination); limiterWired = true; } catch (e) { /* 忽略 */ }
+        }
+        master.connect(limiter);
+      } else {
+        master.connect(ctx.destination);
+      }
     }
 
     async function ensureRunning() {
@@ -876,7 +935,6 @@
       if (!el || el.tagName !== 'VIDEO') return false;
       if (attached.has(el)) return true;
       if (failed.has(el) || pending.has(el)) return false;
-      if (!CFG.enabled) return false;
 
       SourceGuard.install();
 
@@ -947,6 +1005,19 @@
       }
     }
 
+    /** 「响亮」档把限幅器接进链路，其余档让 master 直连 destination（零额外延迟） */
+    function setLimiter(on) {
+      const want = !!on && !CFG.limiter.disabled;
+      const changed = want !== limiting;
+      limiting = want;
+      if (!master) return false;       // 图还没建：意图记着，ensureCtx 会按它接线
+      if (changed) {
+        wire();
+        Log.info(want ? '链路：master → limiter → destination' : '链路：master → destination（不经过限幅器）');
+      }
+      return want ? !!limiter : true;
+    }
+
     return {
       attach: attach,
       isAttached: function (el) { return !!el && attached.has(el); },
@@ -956,6 +1027,8 @@
         desiredDb = db;
         return applyGain(false);
       },
+      setLimiter: setLimiter,
+      isLimiting: function () { return limiting; },
       appliedDb: function () { return appliedDb; },
       desiredDb: function () { return desiredDb; },
       contextState: function () { return ctx ? ctx.state : null; },
@@ -964,6 +1037,8 @@
           pending: pending.size,
           guard: SourceGuard.isInstalled(),
           dummies: SourceGuard.count(),
+          limiting: limiting,
+          path: limiting && limiter ? 'limiter' : 'direct',
         });
       },
     };
@@ -1585,7 +1660,6 @@
     }
 
     async function run(el, why) {
-      if (!CFG.enabled) { set({ state: 'off', text: '已关闭' }); return; }
       const target = Target.resolve();
       if (!target || !el) return;
       // 同一张视频正在跑，先排队 —— 连播/快速切集时不能把新视频漏掉
@@ -1646,6 +1720,7 @@
                 if (!canApplyNow(el, target, info)) return;
                 const est = GainPlan.plan({ measuredI: p.i, truePeak: p.tp });
                 // 先按已有片段落位，不用等整轮抽完；差异小于阈值就不重复淡变，免得抖
+                if (est.limiter !== Engine.isLimiting()) Engine.setLimiter(est.limiter);
                 if (Math.abs(est.gainDb - Engine.desiredDb()) >= CFG.partialDeadbandDb) {
                   Engine.setGainDb(est.gainDb);
                 }
@@ -1682,6 +1757,7 @@
         const ok = await Engine.attach(el);
         // 即便此刻还没接管（自动播放策略拦着），也先把目标增益记下来：
         // 等用户第一次交互、引擎补接管时会自己落位。
+        Engine.setLimiter(plan.limiter);
         Engine.setGainDb(plan.gainDb);
 
         set({
@@ -1736,7 +1812,7 @@
 
       const attempt = function () {
         upgradeTimer = null;
-        if (!CFG.enabled || !CFG.ssrMeta) return;
+        if (!CFG.ssrMeta) return;
         const now = Target.resolve();
         if (!now || now.key !== upgradeKey) return;
         if (Lifecycle.currentElement() !== el) return;
@@ -1768,6 +1844,7 @@
 
           lastMeta = { i: official.i, tp: official.tp, src: 'meta' };
           const plan = GainPlan.plan({ measuredI: official.i, truePeak: official.tp });
+          Engine.setLimiter(plan.limiter);
           Engine.setGainDb(plan.gainDb);
           set({
             source: 'meta',
@@ -1790,11 +1867,10 @@
     function reapply() {
       if (!lastMeta) return false;
       const plan = GainPlan.plan({ measuredI: lastMeta.i, truePeak: lastMeta.tp });
+      Engine.setLimiter(plan.limiter);
       Engine.setGainDb(plan.gainDb);
       const el = Lifecycle.currentElement();
       const ok = el ? Engine.isAttached(el) : false;
-      // 状态灯和状态字必须一起复位：否则从「关闭」切回预设时，
-      // 会留下 state='off' + 「已关闭」的旧文案，灯也一直是灰的
       set({
         state: 'applied',
         text: ok ? '当前响度' : (el && Engine.hasFailed(el) ? '音频源被占用' : '未接管'),
@@ -1913,10 +1989,7 @@
 
     function presetRows() {
       const items = Object.keys(CFG.presets).map(function (k) { return [k, CFG.presets[k].label]; });
-      items.push(['off', '关闭']);
-      const rows = [];
-      for (let i = 0; i < items.length; i += 3) rows.push(radioRow(items.slice(i, i + 3)));
-      return rows.join('<div class="bln-gap"></div>');
+      return radioRow(items);
     }
 
     function html() {
@@ -2130,7 +2203,6 @@
         refs.clear = q('bln-clear');
         refs.preset = {};
         Object.keys(CFG.presets).forEach(function (k) { refs.preset[k] = q('bln-p-' + k); });
-        refs.preset.off = q('bln-p-off');
 
         bind();
         syncControls();
@@ -2233,7 +2305,7 @@
 
     function syncControls() {
       if (!host) return;
-      const cur = CFG.enabled ? CFG.preset : 'off';
+      const cur = CFG.preset;
       Object.keys(refs.preset || {}).forEach(function (k) {
         const el = refs.preset[k];
         if (el) el.checked = (k === cur);
@@ -2247,22 +2319,14 @@
       refs.cache.textContent = '缓存 ' + s.entries + ' / ' + CFG.cacheMax + ' 条';
     }
 
-    /** 选中一个预设（或「关闭」）：有测量值就零下载重算，没有就触发一次分析 */
+    /** 选中一个预设：有测量值就零下载重算，没有就触发一次分析 */
     function applyPreset(k) {
-      if (k === 'off') {
-        CFG.enabled = false;
-        Store.saveSettings();
-        Engine.setGainDb(0);
-        Analyzer.setStatus({ state: 'off', text: '已关闭' });
-        syncControls();
-        return;
-      }
       const p = CFG.presets[k];
       if (!p) return;
       CFG.preset = k;
       CFG.target = p.target;
       CFG.maxBoost = p.maxBoost;
-      CFG.enabled = true;
+      Engine.setLimiter(!!p.limiter);
       Store.saveSettings();
       syncControls();
       const applied = Analyzer.reapply();
@@ -2276,8 +2340,7 @@
     function render(s) {
       if (!host) return;
       const st = s || Analyzer.status;
-      const off = !CFG.enabled || st.state === 'off';
-      const failed = !off && st.state === 'error';
+      const failed = st.state === 'error';
       const reasons = st.reasons || [];
 
       // 报错时：第一行数值换成 error（单位与 [官]/[本] 一起收起），第二行的数值组整块不显示，
@@ -2295,9 +2358,8 @@
       }
       if (refs.st.classList.contains('bln-err')) refs.st.classList.remove('bln-err');
 
-      // 第二行永远是「当前响度」这个说法；关掉时只是不画数值，标题行已经写了「已关闭」
-      refs.st.textContent = off ? '当前响度'
-        : (st.progress ? st.text + ' ' + st.progress : st.text);
+      // 第二行永远是「当前响度」这个说法
+      refs.st.textContent = st.progress ? st.text + ' ' + st.progress : st.text;
 
       // 第二行的数值组永远是「原始 → 实际 LUFS [限]」，单位画在实际值后面、[限] 前面：
       //   -16.0 → -14.0 LUFS      （增益 +2.0 dB）
@@ -2305,22 +2367,21 @@
       //   -10.0 → -14.0 LUFS      （衰减）
       // 单位、箭头、[限] 都是常驻节点，只改文字不改显隐，位置不会跳。
       refs.goal.classList.remove('bln-hide');
-      const hasI = !off && Number.isFinite(st.i);
-      // 还没测出数（读取中 / 采样中 / 已关闭）时整组隐藏，不画「— LUFS」
+      const hasI = Number.isFinite(st.i);
+      // 还没测出数（读取中 / 采样中）时整组隐藏，不画「— LUFS」
       refs.vGroup.classList.toggle('bln-hide', !hasI);
       const actual = hasI && Number.isFinite(st.gain) ? U.round(st.i + st.gain, 1) : null;
       refs.meas.textContent = hasI ? st.i.toFixed(1) : '';
       refs.measUnit.textContent = 'LUFS';
       refs.tgt.textContent = actual === null ? '' : actual.toFixed(1);
-      // 只有「想提没提上去」才挂 [限]
-      const limited = hasI && reasons.indexOf('峰值受限') >= 0;
-      refs.measTag.textContent = limited ? '[限]' : '';
-      // 「已关闭」时数值与单位都收起，只剩这几个字
-      const gainText = off ? '已关闭' : (Number.isFinite(st.gain) ? U.fmtDbNum(st.gain) : '—');
+      // [限] = 峰值挡住了提升（只可能出现在标准 / 安静档）
+      const peakLimited = hasI && reasons.indexOf('峰值受限') >= 0;
+      refs.measTag.textContent = peakLimited ? '[限]' : '';
+      const gainText = Number.isFinite(st.gain) ? U.fmtDbNum(st.gain) : '—';
       refs.gainVal.textContent = gainText;
-      refs.gainUnit.classList.toggle('bln-hide', off);
+      refs.gainUnit.classList.remove('bln-hide');
       // 首行的间距由 bln-head 的 flex 布局给；面板上只有 [官]/[本] 带色（var(--bpx-primary-color)），其余文字用播放器自己的颜色
-      if (refs.src) refs.src.textContent = off ? '' : (st.metaSrc === 'meta' ? '[官]' : '[本]');
+      if (refs.src) refs.src.textContent = st.metaSrc === 'meta' ? '[官]' : (st.metaSrc === 'sample' ? '[本]' : '');
 
       refs.dot.className = 'bln-dot';
       if (st.state === 'applied') refs.dot.classList.add('ok');
@@ -2375,6 +2436,7 @@
       render: render,
       toast: toast,
       syncControls: syncControls,
+      applyPreset: applyPreset,
       isOpen: function () { return open; },
     };
   })();
@@ -2410,7 +2472,6 @@
     }
 
     function onMedia(ev) {
-      if (!CFG.enabled) return;
       if (ev.type === 'emptied') return;
       const el = ev.target;
       Analyzer.run(el, 'media:' + ev.type);
@@ -2439,7 +2500,6 @@
         bind(el);
       }
 
-      if (!CFG.enabled) return;
       await Engine.attach(el);
 
       if (swapped || routeChanged) {
@@ -2491,18 +2551,11 @@
   function registerMenu() {
     if (typeof GM_registerMenuCommand !== 'function') return;
     try {
-      GM_registerMenuCommand('开关响度均衡', function () {
-        CFG.enabled = !CFG.enabled;
-        Store.saveSettings();
-        UI.syncControls();
-        if (CFG.enabled) {
-          Analyzer.setStatus({ state: 'idle', text: '已启用' });
-          Lifecycle.start();
-          void Lifecycle.tick('菜单启用');
-        } else {
-          Engine.setGainDb(0);
-          Analyzer.setStatus({ state: 'off', text: '已关闭' });
-        }
+      GM_registerMenuCommand('切换响亮 / 标准 / 安静', function () {
+        const keys = Object.keys(CFG.presets);
+        const next = keys[(keys.indexOf(CFG.preset) + 1) % keys.length];
+        UI.applyPreset(next);
+        UI.toast('已切到「' + CFG.presets[next].label + '」');
       });
       GM_registerMenuCommand('清空测量缓存', function () {
         Store.clear();
@@ -2533,29 +2586,29 @@
           })(),
           cache: Store.stats(),
           lifecycle: Lifecycle.stats(),
-          config: { enabled: CFG.enabled, preset: CFG.preset, target: CFG.target, maxBoost: CFG.maxBoost, minGain: CFG.minGain },
+          config: { preset: CFG.preset, target: CFG.target, maxBoost: CFG.maxBoost, minGain: CFG.minGain, limiter: Engine.isLimiting() },
         };
       },
       reanalyze: function () { Analyzer.reanalyze(); },
       reapply: function () { return Analyzer.reapply(); },
-      /** 切预设：standard / dynamic / headphone / speaker / night；传 'off' 等于关闭 */
+      /** 切预设：loud / normal / quiet */
       preset: function (k) {
-        if (k === 'off') { CFG.enabled = false; Store.saveSettings(); UI.syncControls(); Engine.setGainDb(0); return true; }
         const p = CFG.presets[k];
         if (!p) return false;
         CFG.preset = k;
         CFG.target = p.target;
         CFG.maxBoost = p.maxBoost;
-        CFG.enabled = true;
+        Engine.setLimiter(!!p.limiter);
         Store.saveSettings();
         UI.syncControls();
         return Analyzer.reapply();
       },
-      presets: function () { return Object.keys(CFG.presets).map(function (k) { return { key: k, label: CFG.presets[k].label, target: CFG.presets[k].target }; }); },
+      presets: function () { return Object.keys(CFG.presets).map(function (k) { return { key: k, label: CFG.presets[k].label, target: CFG.presets[k].target, limiter: !!CFG.presets[k].limiter }; }); },
       setTarget: function (v) {
         if (!Number.isFinite(v)) return false;
         CFG.target = v;
-        CFG.preset = 'custom';
+        CFG.preset = 'custom';       // 逃生口：不在三档里，限幅器随之关闭
+        Engine.setLimiter(false);
         Store.saveSettings();
         UI.syncControls();
         return Analyzer.reapply();
@@ -2597,7 +2650,7 @@
     SourceGuard.install();   // document-start 就装，赶在 B 站建图之前
     UI.init();
 
-    // 即便总开关是关的也要起轮询：控制栏按钮得靠它插进去，否则用户没入口再打开
+    // 一直起轮询：控制栏按钮靠它插进去，路由/换集也靠它跟
     Lifecycle.start();
 
     registerMenu();

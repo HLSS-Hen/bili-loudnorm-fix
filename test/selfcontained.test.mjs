@@ -27,6 +27,18 @@ class FakeNode {
   disconnect() { this.connected.length = 0; }
 }
 class FakeSource extends FakeNode {}
+class FakeCompressor extends FakeNode {
+  constructor(ctx) {
+    super(ctx);
+    const param = (v) => ({ value: v });
+    this.threshold = param(-24);
+    this.knee = param(30);
+    this.ratio = param(12);
+    this.attack = param(0.003);
+    this.release = param(0.25);
+    this.reduction = 0;
+  }
+}
 class FakeGain extends FakeNode {
   constructor(ctx) {
     super(ctx);
@@ -50,6 +62,7 @@ class FakeCtx {
     this.used = new WeakSet();
   }
   createGain() { return new FakeGain(this); }
+  createDynamicsCompressor() { return new FakeCompressor(this); }
   createMediaElementSource(el) {
     if (this.used.has(el)) {
       const e = new Error('already connected');
@@ -300,8 +313,23 @@ group('增益规划');
   near(a.gainDb, 9.8, 0.001, '-23.8 → -14 = +9.8 dB');
 
   const b = GainPlan.plan({ measuredI: -40, truePeak: -20 });
-  near(b.gainDb, 12, 0.001, '提升上限 12 dB 生效');
+  near(b.gainDb, 16, 0.001, '提升上限 16 dB 生效');
   ok(b.reasons.includes('提升上限'), '记录限幅原因');
+
+  // 「响亮」档：目标 -11、不看真峰值、交给限幅器
+  {
+    const cfg = api._.CFG;
+    const saved = { preset: cfg.preset, target: cfg.target };
+    cfg.preset = 'loud';
+    cfg.target = cfg.presets.loud.target;
+    const l = GainPlan.plan({ measuredI: -23.8, truePeak: -3 });
+    near(l.gainDb, 12.8, 0.001, '响亮档 -23.8 → -11 = +12.8 dB（不被峰值预算压）');
+    ok(l.limiter === true && !l.reasons.includes('限幅'), '响亮档标记 limiter，但不产生 [限幅] 文案');
+    ok(!l.reasons.includes('峰值受限'), '响亮档不再报「峰值受限」');
+    cfg.preset = saved.preset;
+    cfg.target = saved.target;
+  }
+  ok(b.limiter === false, '标准档不带限幅');
 
   const c = GainPlan.plan({ measuredI: -23.8, truePeak: -3 });
   near(c.gainDb, 2, 0.001, '峰值预算把 +9.8 压到 +2 dB');
@@ -961,9 +989,9 @@ group('嵌进播放器控制栏：「响」按钮 + 面板');
   // —— 严格复用官方组件：外壳和控件都用 B 站自己的类名
   ok(/class="bui bui-panel bui-dark"/.test(html), '面板外壳用官方 .bui-panel.bui-dark');
   ok(/class="bpx-player-ctrl-setting-menu-right"/.test(html), '内容区用官方设置面板的内边距容器');
-  ok((html.match(/class="bui-radio-item"/g) || []).length === 6, '六个选项都是官方 radio 组件');
-  ok((html.match(/class="bui-radio-input"/g) || []).length === 6, 'radio 输入框用官方类');
-  ok((html.match(/class="bui-radio-label"/g) || []).length === 6, 'radio 标签用官方类');
+  ok((html.match(/class="bui-radio-item"/g) || []).length === 3, '三个选项都是官方 radio 组件');
+  ok((html.match(/class="bui-radio-input"/g) || []).length === 3, 'radio 输入框用官方类');
+  ok((html.match(/class="bui-radio-label"/g) || []).length === 3, 'radio 标签用官方类');
   ok(/class="bui-radio-wrap bui-radio-button"/.test(html), 'radio 组是官方的按钮形态（bui-radio-button）');
   ok(!/class="seg"/.test(html), '不再自绘分段按钮');
   ok(!/class="menu"/.test(html), '不再自绘面板外壳');
@@ -981,18 +1009,19 @@ group('嵌进播放器控制栏：「响」按钮 + 面板');
   ok(!/旁路|toggleBypass|setBypass|isBypass|shiftKey/.test(code), '旁路相关代码全部删除');
   ok(/@match\s+https:\/\/www\.bilibili\.com\/festival\/\*/.test(code), '元数据里加了 /festival/* 匹配');
 
-  ['标准', '高动态', '深夜', '耳机', '外放', '关闭'].forEach(function (label) {
+  ['响亮', '标准', '安静'].forEach(function (label) {
     ok(html.indexOf('>' + label + '<') >= 0, '选项里有「' + label + '」');
   });
   let pos = -1;
   let ordered = true;
-  ['标准', '高动态', '深夜', '耳机', '外放', '关闭'].forEach(function (label) {
+  ['响亮', '标准', '安静'].forEach(function (label) {
     const at = html.indexOf('>' + label + '<');
     if (at < pos) ordered = false;
     pos = at;
   });
-  ok(ordered, '预设顺序：标准 → 高动态 → 深夜 → 耳机 → 外放 → 关闭');
-  ok((html.match(/name="bln-preset"/g) || []).length === 6, '五个预设 + 关闭 = 6 个选项');
+  ok(ordered, '预设顺序：响亮 → 标准 → 安静（对齐 Spotify Loud/Normal/Quiet）');
+  ok((html.match(/name="bln-preset"/g) || []).length === 3, '三档预设 = 3 个选项');
+  ok(html.indexOf('关闭') < 0, '面板里不再有「关闭」');
 
   // hover 打开，离开后收起
   inserted._ev.mouseenter({});
@@ -1021,33 +1050,38 @@ group('嵌进播放器控制栏：「响」按钮 + 面板');
   (docHandlers.keydown || []).forEach((f) => f({ key: 'Escape' }));
   ok(api._.UI.isOpen() === false, 'Esc 关闭面板');
 
-  // 切预设：n 选 1
+  // 切预设：三档对齐 Spotify
   const CFG = api._.CFG;
-  const saved = { preset: CFG.preset, target: CFG.target, boost: CFG.maxBoost, enabled: CFG.enabled };
-  el('bln-p-night')._ev.change({});
-  ok(CFG.preset === 'night', '选中「深夜」· 记下预设名', CFG.preset);
-  ok(CFG.target === -20 && CFG.maxBoost === 6, '「深夜」= -20 LUFS / 上限 +6 dB', CFG.target + '/' + CFG.maxBoost);
-  ok(CFG.enabled === true, '选预设会自动重新启用');
-  ok(el('bln-p-night').checked === true, '「深夜」是选中态');
+  const saved = { preset: CFG.preset, target: CFG.target, boost: CFG.maxBoost };
 
-  el('bln-p-speaker')._ev.change({});
-  ok(CFG.target === -11 && CFG.maxBoost === 10, '「外放」= -11 LUFS / 上限 +10 dB', CFG.target + '/' + CFG.maxBoost);
-  ok(el('bln-p-night').checked === false && el('bln-p-speaker').checked === true, '单选：同一时刻只有一个选中');
+  el('bln-p-loud')._ev.change({});
+  ok(CFG.preset === 'loud', '选中「响亮」· 记下预设名', CFG.preset);
+  ok(CFG.target === -11 && CFG.maxBoost === 16, '「响亮」= -11 LUFS / 上限 +16 dB', CFG.target + '/' + CFG.maxBoost);
+  ok(api._.Engine.isLimiting() === true, '「响亮」打开限幅器');
+  ok(el('bln-p-loud').checked === true, '「响亮」是选中态');
 
-  el('bln-p-off')._ev.change({});
-  ok(CFG.enabled === false, '选「关闭」→ 均衡关掉');
-  ok(CFG.preset === 'speaker', '关掉时预设名仍保留，便于再打开', CFG.preset);
-  ok(el('bln-p-off').checked === true && el('bln-p-speaker').checked === false, '「关闭」是选中态');
+  el('bln-p-normal')._ev.change({});
+  ok(CFG.target === -14, '「标准」= -14 LUFS', CFG.target);
+  ok(api._.Engine.isLimiting() === false, '「标准」旁路限幅器');
+  ok(el('bln-p-loud').checked === false && el('bln-p-normal').checked === true, '单选：同一时刻只有一个选中');
 
-  // 渲染：关闭时不能还显示 dB 和单位
-  api._.UI.render({ state: 'off', text: '已关闭', gain: -0.82, i: -22.2, metaSrc: 'meta', reasons: [] });
-  ok(el('bln-gain-val').textContent === '已关闭', '关闭时第一行显示「已关闭」而不是数值', el('bln-gain-val').textContent);
-  ok(el('bln-st').textContent === '当前响度', '关闭时第二行仍写「当前响度」', el('bln-st').textContent);
-  ok(el('bln-src').textContent === '', '关闭时不显示 [官]/[本]');
-  ok(el('bln-v').classList.contains('bln-hide'), '关闭时数值组整块不显示');
-  ok(!el('bln-dot').classList.contains('ok'), '关闭时状态灯不是绿的');
+  el('bln-p-quiet')._ev.change({});
+  ok(CFG.target === -19, '「安静」= -19 LUFS', CFG.target);
 
-  CFG.enabled = true;
+  // 渲染：响亮档不额外标 [限幅]
+  api._.UI.render({ state: 'applied', text: '当前响度', gain: 3, i: -14, metaSrc: 'meta', reasons: [] });
+  ok(el('bln-meas-tag').textContent === '', '响亮档不显示 [限幅]', el('bln-meas-tag').textContent);
+
+  // 接线：响亮档走 limiter，其余档直连 destination（零额外延迟）
+  api._.Engine.setLimiter(true);
+  ok(api._.Engine.stats().path === 'limiter', '响亮档：master → limiter → destination', api._.Engine.stats().path);
+  api._.Engine.setLimiter(false);
+  ok(api._.Engine.stats().path === 'direct', '标准/安静档：master 直连 destination', api._.Engine.stats().path);
+
+  CFG.preset = saved.preset;
+  CFG.target = saved.target;
+  CFG.maxBoost = saved.boost;
+  api._.Engine.setLimiter(false);
   api._.UI.render({ state: 'applied', text: '当前响度', gain: 0, i: -22.2, metaSrc: 'meta', reasons: ['峰值受限'] });
   ok(el('bln-gain-val').textContent === '+0.0', '增益数值只放数字（+0.0），dB 是独立节点', el('bln-gain-val').textContent);
   ok(!el('bln-v').classList.contains('bln-hide'), '有数值时数值组显示');
